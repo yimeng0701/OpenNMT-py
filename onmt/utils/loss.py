@@ -42,13 +42,15 @@ def build_loss_compute(model, tgt_field, opt, train=True):
     elif isinstance(model.generator[-1], LogSparsemax):
         criterion = SparsemaxLoss(ignore_index=padding_idx, reduction='sum')
     else:
-        criterion = nn.NLLLoss(ignore_index=padding_idx, reduction='sum')
+        criterion = nn.CrossEntropyLoss(ignore_index=padding_idx, reduction='sum')
 
     # if the loss function operates on vectors of raw logits instead of
     # probabilities, only the first part of the generator needs to be
     # passed to the NMTLossCompute. At the moment, the only supported
     # loss function of this kind is the sparsemax loss.
-    use_raw_logits = isinstance(criterion, SparsemaxLoss)
+
+    # all loss fn is calculated on raw_logits
+    use_raw_logits = True
     loss_gen = model.generator[0] if use_raw_logits else model.generator
     if opt.copy_attn:
         compute = onmt.modules.CopyGeneratorLossCompute(
@@ -275,27 +277,36 @@ class NMTLossCompute(LossComputeBase):
             })
         return shard_state
 
-    def _compute_loss(self, batch, output, target, std_attn=None,
+    def _compute_loss(self, batch, output, target, teacher_pred=None, T=1, std_attn=None,
                       coverage_attn=None, align_head=None, ref_align=None):
+        # output: raw logits from student (before linear layer)
+        # teacher_pred: raw logits from teacher (before linear layer)
 
         bottled_output = self._bottle(output)
-
         scores = self.generator(bottled_output)
         gtruth = target.view(-1)
+        hard_loss = self.criterion(scores, gtruth)
 
-        loss = self.criterion(scores, gtruth)
+        bottled_teacher_pred = self._bottle(teacher_pred)
+        teacher_scores = self.generator(bottled_teacher_pred)
+        student_likelihood = F.log_softmax(scores/T, dim=-1)
+        teacher_prob = F.softmax(teacher_scores/T, dim=-1)
+        soft_loss = (-teacher_prob*student_likelihood).sum()
+
+
+
         if self.lambda_coverage != 0.0:
             coverage_loss = self._compute_coverage_loss(
                 std_attn=std_attn, coverage_attn=coverage_attn)
-            loss += coverage_loss
+            hard_loss += coverage_loss
         if self.lambda_align != 0.0:
-            if align_head.dtype != loss.dtype:  # Fix FP16
-                align_head = align_head.to(loss.dtype)
-            if ref_align.dtype != loss.dtype:
-                ref_align = ref_align.to(loss.dtype)
+            if align_head.dtype != hard_loss.dtype:  # Fix FP16
+                align_head = align_head.to(hard_loss.dtype)
+            if ref_align.dtype != hard_loss.dtype:
+                ref_align = ref_align.to(hard_loss.dtype)
             align_loss = self._compute_alignement_loss(
                 align_head=align_head, ref_align=ref_align)
-            loss += align_loss
+            hard_loss += align_loss
         stats = self._stats(loss.clone(), scores, gtruth)
 
         return loss, stats
